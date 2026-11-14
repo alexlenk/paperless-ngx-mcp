@@ -5,8 +5,8 @@
   "version": "0.0.0",
   "description": "MCP server for Paperless-ngx document management. Search, browse, and manage documents and metadata.",
   "author": {
-    "name": "freeformz",
-    "url": "https://github.com/freeformz"
+    "name": "alexlenk",
+    "url": "https://github.com/alexlenk"
   },
   "user_config": {
     "paperless_url": {

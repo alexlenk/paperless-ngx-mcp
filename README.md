@@ -19,7 +19,7 @@ MCP server for [Paperless-ngx](https://docs.paperless-ngx.com/) document managem
 
 ### CoWork / Claude Desktop (MCPB bundle)
 
-Download the `.mcpb` bundle for your platform from the [latest release](https://github.com/freeformz/paperless-ngx-mcp/releases/latest) and install it as an extension. You'll be prompted for your Paperless-ngx URL and API token.
+Download the `.mcpb` bundle for your platform from the [latest release](https://github.com/alexlenk/paperless-ngx-mcp/releases/latest) and install it as an extension. You'll be prompted for your Paperless-ngx URL and API token.
 
 ### Claude Code (CLI)
 
@@ -46,14 +46,18 @@ Add to your project's `.mcp.json`:
 docker run --rm -i \
   -e PAPERLESS_URL=http://localhost:8000 \
   -e PAPERLESS_TOKEN=your-api-token \
-  ghcr.io/freeformz/paperless-ngx-mcp:latest mcp
+  ghcr.io/alexlenk/paperless-ngx-mcp:latest mcp
 ```
 
 ### From source
 
 ```bash
-go install github.com/freeformz/paperless-ngx-mcp@latest
+git clone https://github.com/alexlenk/paperless-ngx-mcp
+cd paperless-ngx-mcp
+make install   # installs to ~/.local/bin; set INSTALL_DIR to change
 ```
+
+This is a fork of [freeformz/paperless-ngx-mcp](https://github.com/freeformz/paperless-ngx-mcp) that adds the [policy filter](#policy-filter). Its Go module path is still `github.com/freeformz/paperless-ngx-mcp`.
 
 ## Configuration
 
