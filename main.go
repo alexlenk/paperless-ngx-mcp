@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -70,13 +71,21 @@ func mcpCmd() *cobra.Command {
 			// skipping the cleanup below.
 			context.AfterFunc(ctx, stop)
 
+			// The policy filter is off unless PAPERLESS_MCP_POLICY_ENABLED is
+			// true. Enabled, it resolves its tag and field names here and
+			// refuses to start if any of them is wrong.
+			clientOpts, err := configurePolicy(ctx, os.Getenv, baseURL, token, http.DefaultTransport, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+
 			dl, err := NewDownloader(downloadConcurrency, downloadDirFromEnv(os.Getenv("PAPERLESS_MCP_DOWNLOAD_DIR")))
 			if err != nil {
 				return fmt.Errorf("create downloader: %w", err)
 			}
 			defer os.RemoveAll(dl.Dir())
 
-			client := NewClient(baseURL, token)
+			client := NewClient(baseURL, token, clientOpts...)
 			srv := NewServer(client, dl)
 			err = server.NewStdioServer(srv).Listen(ctx, os.Stdin, os.Stdout)
 			if errors.Is(err, context.Canceled) && ctx.Err() != nil {

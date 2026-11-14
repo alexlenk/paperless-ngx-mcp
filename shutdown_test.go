@@ -226,10 +226,11 @@ func TestMCPShutsDownGracefullyOnSignal(t *testing.T) {
 			state := p.wait(t)
 
 			// A requested shutdown succeeds, and there is nothing to report.
+			// The only stderr output is the policy filter's startup line.
 			if !state.Success() {
 				t.Errorf("mcp ended with %s after %s, want exit status 0\nstderr:\n%s", state, sig, p.stderr.String())
-			} else if p.stderr.Len() != 0 {
-				t.Errorf("mcp wrote to stderr after %s, want nothing:\n%s", sig, p.stderr.String())
+			} else if got := p.stderr.String(); got != policyDisabledLine {
+				t.Errorf("mcp stderr after %s = %q, want only the startup line %q", sig, got, policyDisabledLine)
 			}
 			if dirs := p.tempDownloadDirs(t); len(dirs) != 0 {
 				t.Errorf("temp download dir left behind after %s: %v", sig, dirs)

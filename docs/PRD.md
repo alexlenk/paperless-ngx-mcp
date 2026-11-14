@@ -58,6 +58,7 @@ The MCP server is a stateless proxy. Each tool call translates to one or more HT
 | MCP Server | Stdio transport, tool registration, request handling |
 | HTTP Client | Paperless-ngx REST API client with auth, versioning, pagination |
 | Tool Handlers | Translate MCP tool calls to HTTP requests and format responses |
+| Policy Filter | Optional `http.RoundTripper` under the HTTP client that limits documents outside a "full" tag tier to metadata and keeps the classification tags and fields read-only (off by default; see [Policy Filter](#policy-filter)) |
 | CLI | Cobra command structure with `mcp` subcommand |
 
 ### Configuration
@@ -68,6 +69,7 @@ The server is configured entirely via environment variables:
 |----------|----------|-------------|
 | `PAPERLESS_URL` | yes | Base URL of the Paperless-ngx instance (e.g., `https://paperless.example.com`) |
 | `PAPERLESS_TOKEN` | yes | API authentication token |
+| `PAPERLESS_MCP_POLICY_ENABLED`, `PAPERLESS_MCP_POLICY_FULL_TAGS`, `PAPERLESS_MCP_POLICY_METADATA_TAGS`, `PAPERLESS_MCP_POLICY_RESTRICTED_TAGS`, `PAPERLESS_MCP_POLICY_PROTECTED_TAGS`, `PAPERLESS_MCP_POLICY_PROTECTED_CUSTOM_FIELDS` | no | Policy filter switch and its tag and custom field names; see [Policy Filter](#policy-filter). |
 | `PAPERLESS_MCP_DOWNLOAD_DIR` | no | Directory for `document_download` disk saves. When set, downloads land here (or in a `dest_dir` subdirectory of it) with their real filenames, are never touched by `cleanup_downloads`, and remain after the server exits. When unset, downloads use a per-instance temp directory (`paperless-ngx-mcp-*` in the system temp dir) that is deleted with its contents on shutdown; see [Shutdown](#shutdown). |
 
 The server always uses Paperless-ngx API version 9. These are passed via the MCP server configuration (`.mcp.json` or MCPB manifest) as environment variables, which is compatible with CoWork and MCPB bundle format.
@@ -89,7 +91,7 @@ SIGKILL can't be caught. A server killed that way (`kill -9`, the OOM killer, or
 | Status | When |
 |--------|------|
 | 0 | Graceful shutdown: stdin EOF, or a first SIGINT, SIGTERM or SIGHUP. A requested shutdown isn't an error, so it doesn't print an error or usage. A response that can't be written because the host has gone is still logged (see [Shutdown](#shutdown)). |
-| 1 | An error, printed to stderr as `Error: <message>`, such as an unset `PAPERLESS_URL` or `PAPERLESS_TOKEN`, or a temp download directory that can't be created. Only flag errors (an unknown flag, a value that doesn't parse, or a `--download-concurrency` below 1) also print usage: the `mcp` command checks its flags, then sets `SilenceUsage`. |
+| 1 | An error, printed to stderr as `Error: <message>`, such as an unset `PAPERLESS_URL` or `PAPERLESS_TOKEN`, a policy filter setting that is invalid or names a tag or custom field that doesn't resolve to exactly one object, or a temp download directory that can't be created. Only flag errors (an unknown flag, a value that doesn't parse, or a `--download-concurrency` below 1) also print usage: the `mcp` command checks its flags, then sets `SilenceUsage`. |
 | 128 + signal number | A second SIGINT, SIGTERM or SIGHUP ended a stalled shutdown. The signal gets its default action, so it kills the process, and shells and Docker report 130, 143 or 129. The temp download directory is left behind. |
 
 ### HTTP Client
@@ -101,6 +103,50 @@ SIGKILL can't be caught. A server killed that way (`kill -9`, the OOM killer, or
 - **Timeouts**: Configurable per-request timeout with sensible default (30s)
 - **Content types**: JSON for most endpoints; multipart/form-data for document uploads
 - **Response caching**: In-memory TTL cache for metadata list endpoints (tags, correspondents, document types, storage paths, custom fields). These change infrequently but are queried often by agents doing classification work. Cache is invalidated on create/update/delete operations for the same resource type. No document content or search results are cached.
+- **Transport**: net/http's default transport, or the policy filter's transport when the filter is enabled. The cache stores response bodies after the transport has returned them, so with the filter on it only ever holds filtered data.
+
+### Policy Filter
+
+An opt-in filter (`policy.go`, `policy_transport.go`) for agents that should work with the metadata of every document their Paperless user can see, but read the text and files only of some. Paperless can't express this itself: its permissions are per document and per object type, not per field. The filter is off unless `PAPERLESS_MCP_POLICY_ENABLED=true`; off, `NewClient` builds the client exactly as without it. User-facing documentation, including the Paperless permissions it relies on and what it does not stop, is in the README's "Policy filter" section.
+
+**Startup.** With the filter on, the full and metadata tag lists must be non-empty. Every configured name is resolved with `GET /api/tags/?name__iexact=…` or `GET /api/custom_fields/?name__iexact=…` and must match exactly one object with the exact, case-sensitive name; otherwise the server exits with an error. The resolved names and IDs are logged to stderr. Off, the server logs `policy filter: disabled`.
+
+**Enforcement.** The filter is installed as `http.Client.Transport`, so every request from every tool passes through it; tool handlers are unchanged. A blocked request is never sent; the transport answers 403 with `{"detail": "policy: <reason>"}`. Lookups (a document's tags, the tag hierarchy) go through the base transport with the request's credentials and are never cached. Requests to another origin than `PAPERLESS_URL` (for example after a redirect), outside `/api/`, or with encoded characters, dot segments or format suffixes in the path are refused.
+
+**Tiers.** From the document's tag IDs, deny wins: any restricted tag → restricted; any metadata tag → metadata; a full tag and neither of those → full; no tier tag → metadata. Restricted is treated like metadata.
+
+**Rule 1: no text outside the full tier.**
+
+| Request | Rule |
+|---|---|
+| `GET`, `DELETE` `/api/documents/{id}/`; `…/metadata/`, `…/notes/`, `…/share_links/` | pass (responses filtered) |
+| `PATCH`/`PUT` `/api/documents/{id}/` | rule 2, then pass (response filtered) |
+| `…/download/`, `…/preview/`, `…/thumb/`, `…/history/`, `…/suggestions/`, `…/ai_suggestions/`, any other per-document action | full tier only; tier looked up uncached via `GET /api/documents/{id}/?fields=id,tags`; a 404 from the lookup (unknown, trashed or version IDs) is passed through |
+| `POST /api/documents/email/`, `POST /api/documents/{id}/email/`, `/api/documents/chat/` | always blocked |
+| `/api/documents/merge/`, `/edit_pdf/`, `/remove_password/`, `/merge_as_versions/`; `bulk_edit` `merge`, `split`, `delete_pages`, `edit_pdf`, `remove_password` | always blocked |
+| `POST /api/documents/bulk_download/` | only an explicit `documents` list (not `all`) of full-tier documents |
+| `/api/documents/rotate/`, `/reprocess/`, `/delete/`; `bulk_edit` `rotate`, `reprocess`, `delete` | pass |
+| `POST /api/storage_paths/test/` | always blocked (templates receive `document.content`) |
+| writes to `/api/share_link_bundles/` | always blocked |
+
+Responses: in every 2xx JSON response, each object with an integer `id` and a `content` or `__search_hit__` key is a document. Its tier comes from its `tags`, or from a batch lookup (`GET /api/documents/?id__in=…&fields=id,tags`) when the response has no tags; documents the lookup doesn't return are metadata. Outside the full tier, `content` and `__search_hit__.highlights` are removed (`score`, `rank` and `note_highlights` stay), and `Content-Length` is updated. A 2xx JSON body that doesn't parse is blocked. Search, `more_like_id` and the `content` filter are not restricted: they may match metadata-tier documents, and `search_autocomplete` suggests words from their text; both are accepted and documented.
+
+**Rule 2: the classification is read-only.** Protected tags are the full, metadata and restricted tags plus `PAPERLESS_MCP_POLICY_PROTECTED_TAGS`; protected fields are `PAPERLESS_MCP_POLICY_PROTECTED_CUSTOM_FIELDS`.
+
+| Request | Blocked when |
+|---|---|
+| `PATCH`/`PUT` `/api/documents/{id}/` with `tags` | the protected subset of the resulting tags differs from the current one. The resulting tags are computed like Paperless does: added tags bring their ancestors, removed tags take their descendants. |
+| `PATCH`/`PUT` `/api/documents/{id}/` with `custom_fields` | a protected field is added, removed (the list replaces all fields) or changes value |
+| `PATCH`/`PUT` `/api/documents/{id}/` with `owner`, `set_permissions` or a true `remove_inbox_tags` | always |
+| `bulk_edit` `add_tag` / `remove_tag` / `modify_tags` | an added tag or one of its ancestors, or a removed tag or one of its descendants, is protected |
+| `bulk_edit` `modify_custom_fields` | `add_custom_fields` or `remove_custom_fields` (list or object form) references a protected field |
+| `bulk_edit` `set_permissions`, `run_workflow`, or any method not named in these tables | always |
+| `POST /api/documents/post_document/` | form field `tags` (with ancestors) or `custom_fields` references a protected tag or field |
+| `POST /api/tags/`, `PATCH`/`PUT`/`DELETE` `/api/tags/{id}/` | the tag is protected or a parent of a protected tag, or `parent` is a protected tag or below one |
+| `PATCH`/`PUT`/`DELETE` `/api/custom_fields/{id}/` | the field is protected |
+| `POST /api/bulk_edit_objects/` | `operation` is `set_permissions`, or `object_type` is `tags` and `objects` contains a protected tag or a parent of one, or selects `all` |
+
+Request bodies that should be JSON (or multipart for uploads) but don't parse are blocked. Everything else passes; Paperless's permissions decide.
 
 ## MCP Tools
 
@@ -589,6 +635,8 @@ paperless-ngx-mcp/
 ├── main.go                 # Entry point, Cobra root command
 ├── server.go               # MCP server setup and tool registration
 ├── client.go               # Paperless-ngx HTTP client
+├── policy.go               # Policy filter: config, name resolution, tiers, tag hierarchy
+├── policy_transport.go     # Policy filter: RoundTripper with the request and response rules
 ├── tools_documents.go      # Document tool handlers
 ├── tools_tags.go           # Tag tool handlers
 ├── tools_correspondents.go # Correspondent tool handlers
@@ -640,6 +688,8 @@ The API version is hardcoded to `9` — the `Accept: application/json; version=9
 - `PostMultipart(path string, fields map[string]string, file io.Reader, filename string) (*http.Response, error)` — Multipart upload
 
 All methods inject `Authorization` and `Accept` headers automatically.
+
+`NewClient(baseURL, token string, opts ...ClientOption)` takes optional settings; `WithTransport(rt)` replaces the transport, which is how the policy filter installs itself.
 
 ### Tool Handler Pattern
 
@@ -731,6 +781,8 @@ Mirrors tasks-mcp release:
 }
 ```
 
+The manifest's `user_config` (abridged above) holds the Paperless URL, the token (`"sensitive": true`), the download directory, and the policy filter settings: a `policy_enabled` boolean (default `false`) and five optional strings (default `""`) mapped to the `PAPERLESS_MCP_POLICY_*` variables.
+
 ## Development Workflow
 
 - **Never push directly to main** — main is protected by branch rulesets
@@ -744,8 +796,9 @@ Mirrors tasks-mcp release:
 - **Unit tests**: Mock HTTP responses to test tool handlers independently
 - **Integration tests**: Optional, require a running Paperless-ngx instance (skipped in CI by default)
 - **Client tests**: Test HTTP client request construction, header injection, error handling
-- **Shutdown tests**: `shutdown_test.go` (Unix only) runs the test binary as the `mcp` command in a subprocess, since its `TestMain` calls `main()` when `PAPERLESS_MCP_TEST_RUN_MAIN=1`, and checks that SIGINT, SIGTERM and SIGHUP each exit 0 with nothing on stderr, that they and a host disconnect mid-call all remove the temp download directory, that stdin EOF or SIGTERM during a slow render still exits 0 promptly, and that a second signal ends a stalled shutdown
+- **Shutdown tests**: `shutdown_test.go` (Unix only) runs the test binary as the `mcp` command in a subprocess, since its `TestMain` calls `main()` when `PAPERLESS_MCP_TEST_RUN_MAIN=1`, and checks that SIGINT, SIGTERM and SIGHUP each exit 0 with nothing on stderr but the policy filter's startup line, that they and a host disconnect mid-call all remove the temp download directory, that stdin EOF or SIGTERM during a slow render still exits 0 promptly, and that a second signal ends a stalled shutdown
 - **CLI tests**: `main_test.go` checks that flag errors print usage and other errors, such as an unset `PAPERLESS_URL` or `PAPERLESS_TOKEN`, don't
+- **Policy filter tests**: `policy_test.go` covers configuration, startup name resolution, tiers and the tag hierarchy; `policy_transport_test.go` runs every request and response rule against an in-memory fake Paperless, checks that blocked requests never reach it, and calls every registered tool through the MCP server for a metadata-tier document whose text, highlights and files carry a marker that must not appear in any result or downloaded file
 - **Coverage threshold**: 70% minimum (enforced in CI)
 
 Test helpers should provide:

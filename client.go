@@ -28,10 +28,22 @@ type Client struct {
 	cache      *Cache
 }
 
+// ClientOption configures a Client.
+type ClientOption func(*Client)
+
+// WithTransport sets the RoundTripper that carries all Paperless traffic.
+// The policy filter installs itself this way. Without it, the client uses
+// net/http's default transport.
+func WithTransport(rt http.RoundTripper) ClientOption {
+	return func(c *Client) {
+		c.httpClient.Transport = rt
+	}
+}
+
 // NewClient creates a new Paperless-ngx API client with in-memory caching.
-func NewClient(baseURL, token string) *Client {
+func NewClient(baseURL, token string, opts ...ClientOption) *Client {
 	parsedBase := strings.TrimRight(baseURL, "/")
-	return &Client{
+	c := &Client{
 		baseURL: parsedBase,
 		token:   token,
 		httpClient: &http.Client{
@@ -49,6 +61,10 @@ func NewClient(baseURL, token string) *Client {
 		},
 		cache: NewCache(defaultCacheTTL),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
