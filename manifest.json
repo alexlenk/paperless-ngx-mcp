@@ -5,8 +5,8 @@
   "version": "0.0.0",
   "description": "MCP server for Paperless-ngx document management. Search, browse, and manage documents and metadata.",
   "author": {
-    "name": "freeformz",
-    "url": "https://github.com/freeformz"
+    "name": "alexlenk",
+    "url": "https://github.com/alexlenk"
   },
   "user_config": {
     "paperless_url": {
@@ -29,6 +29,48 @@
       "description": "Optional directory for document downloads. When set, downloaded files are saved here with their real filenames and are not auto-cleaned. When unset, a temp directory is used.",
       "required": false,
       "default": ""
+    },
+    "policy_enabled": {
+      "type": "boolean",
+      "title": "Policy filter",
+      "description": "Switch on the tag-based policy filter: documents outside the full tier expose metadata only, and the classification tags and fields can't be changed. Off by default.",
+      "required": false,
+      "default": false
+    },
+    "policy_full_tags": {
+      "type": "string",
+      "title": "Policy: full tags",
+      "description": "Comma-separated tag names whose documents may expose text and files. Required when the policy filter is on.",
+      "required": false,
+      "default": ""
+    },
+    "policy_metadata_tags": {
+      "type": "string",
+      "title": "Policy: metadata tags",
+      "description": "Comma-separated tag names whose documents expose metadata only. Required when the policy filter is on.",
+      "required": false,
+      "default": ""
+    },
+    "policy_restricted_tags": {
+      "type": "string",
+      "title": "Policy: restricted tags",
+      "description": "Comma-separated tag names of documents that should never be visible to the API user (listed so they are protected).",
+      "required": false,
+      "default": ""
+    },
+    "policy_protected_tags": {
+      "type": "string",
+      "title": "Policy: protected tags",
+      "description": "Further comma-separated tag names the agent may never add, remove, rename or delete, such as re-classification triggers.",
+      "required": false,
+      "default": ""
+    },
+    "policy_protected_custom_fields": {
+      "type": "string",
+      "title": "Policy: protected custom fields",
+      "description": "Comma-separated custom field names the agent may never set, change, remove, rename or delete.",
+      "required": false,
+      "default": ""
     }
   },
   "server": {
@@ -40,7 +82,13 @@
       "env": {
         "PAPERLESS_URL": "${user_config.paperless_url}",
         "PAPERLESS_TOKEN": "${user_config.paperless_token}",
-        "PAPERLESS_MCP_DOWNLOAD_DIR": "${user_config.download_dir}"
+        "PAPERLESS_MCP_DOWNLOAD_DIR": "${user_config.download_dir}",
+        "PAPERLESS_MCP_POLICY_ENABLED": "${user_config.policy_enabled}",
+        "PAPERLESS_MCP_POLICY_FULL_TAGS": "${user_config.policy_full_tags}",
+        "PAPERLESS_MCP_POLICY_METADATA_TAGS": "${user_config.policy_metadata_tags}",
+        "PAPERLESS_MCP_POLICY_RESTRICTED_TAGS": "${user_config.policy_restricted_tags}",
+        "PAPERLESS_MCP_POLICY_PROTECTED_TAGS": "${user_config.policy_protected_tags}",
+        "PAPERLESS_MCP_POLICY_PROTECTED_CUSTOM_FIELDS": "${user_config.policy_protected_custom_fields}"
       },
       "platform_overrides": {
         "win32": {

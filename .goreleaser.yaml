@@ -44,5 +44,5 @@ changelog:
 
 release:
   github:
-    owner: freeformz
+    owner: alexlenk
     name: paperless-ngx-mcp
