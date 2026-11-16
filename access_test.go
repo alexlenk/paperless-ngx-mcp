@@ -5,7 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"log/slog"
 	"net/http"
@@ -155,6 +158,40 @@ func TestAccessVerifier(t *testing.T) {
 			return parts[0] + "." + other[1] + "." + parts[2]
 		}, "verify"},
 		{"not a JWT", func() string { return "oauth:CvNooOpaque" }, "malformed"},
+		{"alg none", func() string {
+			header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT","kid":"test-key-1"}`))
+			payload, _ := json.Marshal(f.claims(testEmail))
+			return header + "." + base64.RawURLEncoding.EncodeToString(payload) + "."
+		}, `unexpected signature algorithm "none"`},
+		{"HS256 keyed with the public key", func() string {
+			pub, err := x509.MarshalPKIXPublicKey(&f.key.PublicKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pemKey := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pub})
+			signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.HS256, Key: pemKey},
+				(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", f.kid))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := jwt.Signed(signer).Claims(f.claims(testEmail)).Serialize()
+			if err != nil {
+				t.Fatal(err)
+			}
+			return raw
+		}, `unexpected signature algorithm "HS256"`},
+		{"RS384", func() string {
+			signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS384, Key: jose.JSONWebKey{Key: f.key, KeyID: f.kid}},
+				(&jose.SignerOptions{}).WithType("JWT"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := jwt.Signed(signer).Claims(f.claims(testEmail)).Serialize()
+			if err != nil {
+				t.Fatal(err)
+			}
+			return raw
+		}, `unexpected signature algorithm "RS384"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			email, err := v.verify(context.Background(), tc.token())

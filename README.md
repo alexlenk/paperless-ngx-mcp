@@ -49,7 +49,7 @@ docker run --rm -i \
   ghcr.io/alexlenk/paperless-ngx-mcp:latest mcp
 ```
 
-The image is based on distroless `static-debian12:nonroot` and runs as an unprivileged user (UID 65532). A directory you mount for `PAPERLESS_MCP_DOWNLOAD_DIR` must be writable by that user. To run the server over HTTP instead, see [HTTP mode](#http-mode-serve).
+To run the server over HTTP instead, see [HTTP mode](#http-mode-serve).
 
 ### From source
 
@@ -200,9 +200,9 @@ The rules were checked against Paperless-ngx 3.4.2. Re-check them when upgrading
 - **Cloudflare Access must vouch for every request.** Cloudflare passes a signed JWT in the `Cf-Access-Jwt-Assertion` header. `serve` checks its RS256 signature against the team's published keys, the issuer, the audience (the Access application's AUD tag), the expiry, and the email against an allowlist. Any failure answers `401` with no detail; the reason is logged. Service-token JWTs, which carry no email, are refused.
 - **The policy filter is mandatory.** `serve` refuses to start unless `PAPERLESS_MCP_POLICY_ENABLED=true` and the filter is fully configured (see [Policy filter](#policy-filter)).
 - **No tools that use the server's own disk.** `document_upload` (it reads a file path on the server, which in a container includes `/proc/self/environ` and thus the token) and `cleanup_downloads` are not offered, and `document_download` returns content inline only (no `dest_dir`, no `content` switch). No download directory is created, so the root filesystem can be read-only.
-- **Audit log.** One JSON line per tool call on stdout: time, email, tool, the document IDs named in the arguments, the result (`ok`, `refused_by_policy` or `error`), the number of policy blocks and the duration. It never contains other argument values or any part of a result.
+- **Audit log.** One JSON line per tool call on stdout: time, email, tool, the document IDs named in the arguments, the result (`ok`, `refused_by_policy`, `partly_refused_by_policy` for e.g. a multi-document download where only some were refused, or `error`), the number of policy blocks and the duration. It never contains other argument values or any part of a result.
 
-Endpoints: `/mcp` (the MCP endpoint; every method needs a valid Access JWT, otherwise `401`) and `GET /healthz` (unauthenticated, answers `ok`). Other paths answer `404`. Sessions are stateless.
+Endpoints: `/mcp` (the MCP endpoint; every method needs a valid Access JWT, otherwise `401`; only `POST` is served, other methods answer `405`) and `GET /healthz` (unauthenticated, answers `ok`). Other paths answer `404`. Sessions are stateless, and the optional server-to-client `GET` stream is not offered.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -222,6 +222,7 @@ services:
   paperless-mcp:
     image: ghcr.io/alexlenk/paperless-ngx-mcp:<version>
     command: ["serve"]
+    user: "65532:65532"   # run as an unprivileged user
     environment:
       PAPERLESS_URL: http://<paperless service>:8000
       PAPERLESS_TOKEN: <token of the restricted Paperless user>

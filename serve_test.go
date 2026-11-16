@@ -18,6 +18,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // serveFixture runs serve mode's HTTP handler against the fake Paperless,
@@ -490,16 +492,130 @@ func TestAuditDocumentIDs(t *testing.T) {
 	}{
 		{"document_get", map[string]any{"id": float64(616)}, []int{616}},
 		{"document_get", map[string]any{"id": "616"}, []int{616}},
+		// Parsed like the tools parse them (GetFloat, truncated), so these
+		// reach document 1 and must be logged as such.
+		{"document_get", map[string]any{"id": "1.5"}, []int{1}},
+		{"document_get", map[string]any{"id": "1e0"}, []int{1}},
+		{"document_get", map[string]any{"id": "+1"}, []int{1}},
 		{"document_download", map[string]any{"ids": "[1, 2, 2]"}, []int{1, 2}},
-		{"document_bulk_edit", map[string]any{"documents": "[3]", "method": "add_tag"}, []int{3}},
+		{"document_bulk_edit", map[string]any{"documents": "[3.0]", "method": "add_tag"}, []int{3}},
 		{"document_list", map[string]any{"more_like_id": float64(9), "query": "tax"}, []int{9}},
 		{"share_link_create", map[string]any{"document": float64(5)}, []int{5}},
 		{"storage_path_test", map[string]any{"document_id": float64(7), "path": "x"}, []int{7}},
+		{"trash_action", map[string]any{"documents": "[8]", "action": "restore"}, []int{8}},
 		{"document_type_get", map[string]any{"id": float64(4)}, nil},
 		{"tag_get", map[string]any{"id": float64(10)}, nil},
+		{"processed_mail_bulk_delete", map[string]any{"ids": "[11]"}, nil},
 	} {
-		if got := auditDocumentIDs(tc.tool, tc.args); !slices.Equal(got, tc.want) {
+		req := mcp.CallToolRequest{Params: mcp.CallToolParams{Name: tc.tool, Arguments: tc.args}}
+		if got := auditDocumentIDs(req); !slices.Equal(got, tc.want) {
 			t.Errorf("auditDocumentIDs(%s, %v) = %v, want %v", tc.tool, tc.args, got, tc.want)
 		}
+	}
+}
+
+func TestServeMCPEndpointMethods(t *testing.T) {
+	f := newServeFixture(t)
+	for _, method := range []string{http.MethodGet, http.MethodDelete, http.MethodPut, http.MethodPost} {
+		// Without a token, every method is refused before anything else.
+		req, _ := http.NewRequest(method, f.srv.URL+mcpEndpointPath, strings.NewReader("{}"))
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s without token: %d, want 401", method, resp.StatusCode)
+		}
+		if method == http.MethodPost {
+			continue
+		}
+		// With a token, only POST is served.
+		req, _ = http.NewRequest(method, f.srv.URL+mcpEndpointPath, nil)
+		req.Header.Set(accessJWTHeader, f.access.token(t, nil))
+		req.Header.Set("Accept", "text/event-stream")
+		resp, err = http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != http.MethodPost {
+			t.Errorf("%s with token: %d (Allow %q), want 405 with Allow: POST", method, resp.StatusCode, resp.Header.Get("Allow"))
+		}
+	}
+}
+
+// TestServeBehindLoopbackConnector covers a tunnel connector that reaches
+// serve via localhost and forwards the public hostname as Host.
+func TestServeBehindLoopbackConnector(t *testing.T) {
+	f := newServeFixture(t) // httptest listens on 127.0.0.1
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "document_get", "arguments": map[string]any{"id": docFull}}})
+	req, _ := http.NewRequest(http.MethodPost, f.srv.URL+mcpEndpointPath, bytes.NewReader(body))
+	req.Host = "paperless-mcp.example.com"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set(accessJWTHeader, f.access.token(t, nil))
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(raw, []byte(publicMarker)) {
+		t.Errorf("loopback with public Host: %d %s", resp.StatusCode, raw)
+	}
+}
+
+func TestRunHTTPServerShutdownCutsOffHungRequests(t *testing.T) {
+	old := shutdownTimeout
+	shutdownTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { shutdownTimeout = old })
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(started)
+		<-release // never finishes on its own
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runHTTPServer(ctx, ln, handler) }()
+
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/")
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("runHTTPServer = %v, want nil after a requested shutdown", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runHTTPServer did not return after the shutdown timeout")
+	}
+}
+
+func TestServeAuditPartialRefusal(t *testing.T) {
+	f := newServeFixture(t)
+	_, raw := f.call(t, "document_download", map[string]any{"ids": fmt.Sprintf("[%d, %d]", docFull, docMetadata)})
+	if bytes.Contains(raw, []byte(secretMarker)) {
+		t.Fatalf("mixed download leaked: %s", raw)
+	}
+	lines := f.auditLines(t)
+	if len(lines) != 1 || lines[0]["result"] != "partly_refused_by_policy" || lines[0]["policy_blocks"] != float64(1) {
+		t.Errorf("audit = %v, want one partly_refused_by_policy line with 1 block", lines)
 	}
 }

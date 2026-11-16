@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,9 +33,12 @@ const (
 	mcpEndpointPath  = "/mcp"
 	healthPath       = "/healthz"
 	maxRequestBody   = 16 << 20 // JSON-RPC requests are small; this only caps abuse
-	shutdownTimeout  = 10 * time.Second
 	healthcheckLimit = 5 * time.Second
 )
+
+// shutdownTimeout is how long a shutdown waits for requests in flight before
+// closing their connections. A variable so tests can shorten it.
+var shutdownTimeout = 10 * time.Second
 
 // remoteInstructions is appended to the server instructions in serve mode.
 const remoteInstructions = `
@@ -120,6 +122,13 @@ func newServeHandler(ctx context.Context, client *Client, downloadConcurrency in
 	streamable := server.NewStreamableHTTPServer(srv,
 		server.WithEndpointPath(mcpEndpointPath),
 		server.WithStateLess(true),
+		// mcp-go refuses requests that arrive on a loopback address with a
+		// non-loopback Host header, to stop DNS rebinding against
+		// unauthenticated local servers. Here every request needs a signed
+		// Access JWT, which a rebinding page cannot produce, and the check
+		// would break a tunnel connector that reaches serve via localhost
+		// (it forwards the public hostname as Host).
+		server.WithDisableLocalhostProtection(true),
 	)
 
 	mux := http.NewServeMux()
@@ -127,9 +136,28 @@ func newServeHandler(ctx context.Context, client *Client, downloadConcurrency in
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, "ok\n")
 	})
-	mux.Handle(mcpEndpointPath, requireAccess(newAccessVerifier(ctx, access), logger,
-		http.MaxBytesHandler(streamable, maxRequestBody)))
+	// The key set outlives the signal context, so keys can still be fetched
+	// while requests drain during shutdown.
+	verifier := newAccessVerifier(context.WithoutCancel(ctx), access)
+	mux.Handle(mcpEndpointPath, requireAccess(verifier, logger,
+		postOnly(http.MaxBytesHandler(streamable, maxRequestBody))))
 	return mux
+}
+
+// postOnly lets only POST through to the MCP endpoint. Sessions are
+// stateless and no tool sends server-initiated messages, so the optional GET
+// stream is not offered (the MCP spec allows 405 for it). In mcp-go a GET
+// would register a long-lived session that later stateless requests join,
+// and its open stream would hold up shutdown.
+func postOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // newRemoteMCPServer is NewServer for serve mode: the same tools, minus the
@@ -176,7 +204,10 @@ func runHTTPServer(ctx context.Context, ln net.Listener, handler http.Handler) e
 	httpSrv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       time.Minute, // request bodies are small JSON-RPC messages
 		IdleTimeout:       2 * time.Minute,
+		// No WriteTimeout: an inline download of a large document can take a
+		// while to stream out.
 	}
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpSrv.Serve(ln) }()
@@ -188,7 +219,9 @@ func runHTTPServer(ctx context.Context, ln net.Listener, handler http.Handler) e
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("shut down HTTP server: %w", err)
+			// Requests still running after the grace period are cut off. The
+			// shutdown was requested, so this is still a clean exit.
+			_ = httpSrv.Close()
 		}
 		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
@@ -275,17 +308,23 @@ func auditMiddleware(logger *slog.Logger) server.ToolHandlerMiddleware {
 			rec.mu.Lock()
 			blocks := rec.policyBlocks
 			rec.mu.Unlock()
+			docs := auditDocumentIDs(request)
+			failed := err != nil || result == nil || result.IsError
 			outcome := "ok"
 			switch {
-			case blocks > 0:
+			case blocks > 0 && (failed || blocks >= len(docs)):
 				outcome = "refused_by_policy"
-			case err != nil || result == nil || result.IsError:
+			case blocks > 0:
+				// Some requests were blocked and the rest succeeded, as in a
+				// download of several documents of which some are refused.
+				outcome = "partly_refused_by_policy"
+			case failed:
 				outcome = "error"
 			}
 			logger.Info("tool call",
 				"email", identityFrom(ctx),
 				"tool", request.Params.Name,
-				"documents", auditDocumentIDs(request.Params.Name, request.GetArguments()),
+				"documents", docs,
 				"result", outcome,
 				"policy_blocks", blocks,
 				"duration_ms", time.Since(start).Milliseconds(),
@@ -298,14 +337,28 @@ func auditMiddleware(logger *slog.Logger) server.ToolHandlerMiddleware {
 // maxAuditIDs caps the document IDs logged per call.
 const maxAuditIDs = 100
 
-// auditDocumentIDs extracts document IDs from tool arguments: the parameters
-// that name documents in every tool, plus "id" on document_* tools (other
-// than document_type_*, whose id is a document type).
-func auditDocumentIDs(tool string, args map[string]any) []int {
-	keys := []string{"ids", "documents", "document", "document_id", "more_like_id"}
-	if strings.HasPrefix(tool, "document_") && !strings.HasPrefix(tool, "document_type_") {
-		keys = append(keys, "id")
+// auditDocumentIDs extracts the document IDs a tool call names, parsed the
+// way the tool handlers parse them (numbers via GetFloat, truncated to int;
+// ID lists as JSON arrays of integers). Only parameters that hold document
+// IDs count: on document_* tools (not document_type_*) "id", "ids",
+// "documents" and "more_like_id"; elsewhere the named document parameters
+// of share_link_create, storage_path_test and trash_action.
+func auditDocumentIDs(request mcp.CallToolRequest) []int {
+	tool := request.Params.Name
+	var scalars, lists []string
+	switch {
+	case strings.HasPrefix(tool, "document_") && !strings.HasPrefix(tool, "document_type_"):
+		scalars = []string{"id", "more_like_id"}
+		lists = []string{"ids", "documents"}
+	case tool == "share_link_create":
+		scalars = []string{"document"}
+	case tool == "storage_path_test":
+		scalars = []string{"document_id"}
+	case tool == "trash_action":
+		lists = []string{"documents"}
 	}
+
+	args := request.GetArguments()
 	var ids []int
 	seen := map[int]bool{}
 	add := func(id int) {
@@ -314,31 +367,21 @@ func auditDocumentIDs(tool string, args map[string]any) []int {
 			ids = append(ids, id)
 		}
 	}
-	for _, key := range keys {
-		switch v := args[key].(type) {
-		case float64:
-			add(int(v))
-		case json.Number:
-			if n, err := strconv.Atoi(v.String()); err == nil {
-				add(n)
-			}
-		case string:
-			s := strings.TrimSpace(v)
-			if n, err := strconv.Atoi(s); err == nil {
-				add(n)
-				continue
-			}
-			var list []int
-			if json.Unmarshal([]byte(s), &list) == nil {
-				for _, n := range list {
-					add(n)
-				}
-			}
-		case []any:
-			for _, item := range v {
-				if n, ok := asInt(item); ok {
-					add(n)
-				}
+	for _, key := range scalars {
+		if _, ok := args[key]; ok {
+			add(int(request.GetFloat(key, 0)))
+		}
+	}
+	for _, key := range lists {
+		s, ok := args[key].(string)
+		if !ok {
+			continue
+		}
+		// Floats as well: bulk tools pass the list to Paperless as given.
+		var list []float64
+		if json.Unmarshal([]byte(s), &list) == nil {
+			for _, n := range list {
+				add(int(n))
 			}
 		}
 	}
