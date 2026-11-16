@@ -46,3 +46,6 @@ release:
   github:
     owner: alexlenk
     name: paperless-ngx-mcp
+  # Release candidates (tags containing "-rc", e.g. v0.3.5-fork.2-rc.1) are
+  # published but never marked as the latest release.
+  make_latest: '{{ if contains .Tag "-rc" }}false{{ else }}true{{ end }}'
