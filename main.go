@@ -28,7 +28,7 @@ func rootCmd() *cobra.Command {
 		Long:  "paperless-ngx-mcp is an MCP server that exposes the Paperless-ngx REST API as MCP tools for AI agents.",
 	}
 	cmd.Version = version
-	cmd.AddCommand(mcpCmd())
+	cmd.AddCommand(mcpCmd(), serveCmd(), healthcheckCmd())
 	return cmd
 }
 

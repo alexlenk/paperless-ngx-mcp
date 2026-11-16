@@ -49,6 +49,8 @@ docker run --rm -i \
   ghcr.io/alexlenk/paperless-ngx-mcp:latest mcp
 ```
 
+The image is based on distroless `static-debian12:nonroot` and runs as an unprivileged user (UID 65532). To run the server over HTTP instead, see [HTTP mode](#http-mode-serve).
+
 ### From source
 
 ```bash
@@ -75,7 +77,15 @@ Generate an API token in Paperless-ngx under **Settings > Administration > Auth 
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--download-concurrency` | 5 | Max parallel document downloads (at least 1) |
+| `--download-concurrency` | 5 | Max parallel document downloads (at least 1), for `mcp` and `serve` |
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `mcp` | MCP server over stdio, for MCP clients that start the server themselves (Claude Desktop, Claude Code) |
+| `serve` | MCP server over Streamable HTTP, behind Cloudflare Access; see [HTTP mode](#http-mode-serve) |
+| `healthcheck` | Exits 0 if a `serve` instance answers on its local health endpoint; for Docker healthchecks |
 
 ### Exit Status
 
@@ -182,6 +192,70 @@ The filter relies on Paperless permissions for everything it doesn't filter. Set
 Keep the server's binary and configuration where the agent can't edit them; otherwise the agent could switch the filter off.
 
 The rules were checked against Paperless-ngx 3.4.2. Re-check them when upgrading Paperless.
+
+## HTTP mode (`serve`)
+
+`serve` offers the same MCP server over [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http), so a client that runs elsewhere, such as a Claude custom connector used by a cloud scheduled task, can reach it. It is built to sit behind [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/) with Managed OAuth, reached through a Cloudflare Tunnel, and it is stricter than `mcp`:
+
+- **Cloudflare Access must vouch for every request.** Cloudflare passes a signed JWT in the `Cf-Access-Jwt-Assertion` header. `serve` checks its RS256 signature against the team's published keys, the issuer, the audience (the Access application's AUD tag), the expiry, and the email against an allowlist. Any failure answers `401` with no detail; the reason is logged. Service-token JWTs, which carry no email, are refused.
+- **The policy filter is mandatory.** `serve` refuses to start unless `PAPERLESS_MCP_POLICY_ENABLED=true` and the filter is fully configured (see [Policy filter](#policy-filter)).
+- **No tools that use the server's own disk.** `document_upload` (it reads a file path on the server, which in a container includes `/proc/self/environ` and thus the token) and `cleanup_downloads` are not offered, and `document_download` returns content inline only (no `dest_dir`, no `content` switch). No download directory is created, so the root filesystem can be read-only.
+- **Audit log.** One JSON line per tool call on stdout: time, email, tool, the document IDs named in the arguments, the result (`ok`, `refused_by_policy` or `error`), the number of policy blocks and the duration. It never contains other argument values or any part of a result.
+
+Endpoints: `POST /mcp` (the MCP endpoint, behind the Access check) and `GET /healthz` (unauthenticated, answers `ok`). Everything else is `404`. Sessions are stateless.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PAPERLESS_URL`, `PAPERLESS_TOKEN` | yes | As for `mcp` |
+| `PAPERLESS_MCP_POLICY_*` | yes | The policy filter, enabled and configured |
+| `PAPERLESS_MCP_ACCESS_TEAM_DOMAIN` | yes | Your Cloudflare Access team domain, e.g. `https://<team>.cloudflareaccess.com`. The JWT's issuer must match it, and the signing keys are fetched from `<team domain>/cdn-cgi/access/certs`. |
+| `PAPERLESS_MCP_ACCESS_AUD` | yes | The Access application's AUD tag |
+| `PAPERLESS_MCP_ALLOWED_EMAILS` | yes | Comma-separated email addresses allowed to use the server (case-insensitive) |
+| `PAPERLESS_MCP_HTTP_ADDR` | no | Listen address, default `:8080` |
+
+Without any of the required settings, `serve` exits with an error before it listens.
+
+Example Docker Compose services, next to Paperless on the same internal network (fill in versions, names and secrets; the tunnel's public hostname routes to `http://paperless-mcp:8080`):
+
+```yaml
+services:
+  paperless-mcp:
+    image: ghcr.io/alexlenk/paperless-ngx-mcp:<version>
+    command: ["serve"]
+    environment:
+      PAPERLESS_URL: http://<paperless service>:8000
+      PAPERLESS_TOKEN: <token of the restricted Paperless user>
+      PAPERLESS_MCP_POLICY_ENABLED: "true"
+      PAPERLESS_MCP_POLICY_FULL_TAGS: dp:public,dp:internal
+      PAPERLESS_MCP_POLICY_METADATA_TAGS: dp:confidential,dp:manual-review
+      PAPERLESS_MCP_POLICY_RESTRICTED_TAGS: dp:restricted
+      PAPERLESS_MCP_POLICY_PROTECTED_TAGS: gpt-reprocess,gpt-reset,paperless-gpt-auto,paperless-gpt-ocr-auto
+      PAPERLESS_MCP_POLICY_PROTECTED_CUSTOM_FIELDS: AI privacy class,Privacy triggers
+      PAPERLESS_MCP_ACCESS_TEAM_DOMAIN: https://<team>.cloudflareaccess.com
+      PAPERLESS_MCP_ACCESS_AUD: <AUD tag of the Access application>
+      PAPERLESS_MCP_ALLOWED_EMAILS: <your email>
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "/paperless-ngx-mcp", "healthcheck"]
+      interval: 30s
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:<version>   # 2025.4.0 or later for TUNNEL_TOKEN_FILE
+    command: ["tunnel", "run"]
+    environment:
+      TUNNEL_TOKEN_FILE: /run/secrets/tunnel_token
+    secrets: [tunnel_token]
+    restart: unless-stopped
+
+secrets:
+  tunnel_token:
+    file: ./tunnel_token.txt
+```
+
+Publish no ports: cloudflared connects outbound, and only it talks to `paperless-mcp`. Give the tunnel exactly one public hostname, pointing at `paperless-mcp`, and none for Paperless itself.
 
 ## Tools
 

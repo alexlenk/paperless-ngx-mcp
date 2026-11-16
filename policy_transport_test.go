@@ -1190,8 +1190,11 @@ func TestPolicyNoHTTPClientBypass(t *testing.T) {
 			if m == "" {
 				continue
 			}
-			// client.go builds the one http.Client all traffic goes through.
-			if f == "client.go" && m == "http.Client{" {
+			// client.go builds the one http.Client all Paperless traffic goes
+			// through. access.go fetches Cloudflare Access signing keys and
+			// serve.go's healthcheck calls the local health endpoint; neither
+			// talks to Paperless.
+			if m == "http.Client{" && (f == "client.go" || f == "access.go" || f == "serve.go") {
 				continue
 			}
 			t.Errorf("%s:%d: %q bypasses Client and the policy filter", f, i+1, strings.TrimSpace(line))

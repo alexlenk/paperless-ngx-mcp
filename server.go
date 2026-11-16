@@ -5,12 +5,16 @@ import (
 )
 
 // NewServer creates and configures the MCP server with all tool registrations.
-func NewServer(client *Client, dl *Downloader) *server.MCPServer {
+// Extra options are applied after the defaults, so they can override them
+// (serve mode replaces the instructions and adds an audit middleware).
+func NewServer(client *Client, dl *Downloader, opts ...server.ServerOption) *server.MCPServer {
 	srv := server.NewMCPServer(
 		"paperless-ngx-mcp",
 		version,
-		server.WithToolCapabilities(true),
-		server.WithInstructions(serverInstructions),
+		append([]server.ServerOption{
+			server.WithToolCapabilities(true),
+			server.WithInstructions(serverInstructions),
+		}, opts...)...,
 	)
 
 	registerDocumentTools(srv, client)

@@ -59,7 +59,8 @@ The MCP server is a stateless proxy. Each tool call translates to one or more HT
 | HTTP Client | Paperless-ngx REST API client with auth, versioning, pagination |
 | Tool Handlers | Translate MCP tool calls to HTTP requests and format responses |
 | Policy Filter | Optional `http.RoundTripper` under the HTTP client that limits documents outside a "full" tag tier to metadata and keeps the classification tags and fields read-only (off by default; see [Policy Filter](#policy-filter)) |
-| CLI | Cobra command structure with `mcp` subcommand |
+| CLI | Cobra command structure with `mcp` (stdio), `serve` (Streamable HTTP) and `healthcheck` subcommands |
+| HTTP Mode | `serve`: the MCP server over Streamable HTTP behind Cloudflare Access, with the policy filter mandatory (see [HTTP Mode](#http-mode)) |
 
 ### Configuration
 
@@ -104,6 +105,17 @@ SIGKILL can't be caught. A server killed that way (`kill -9`, the OOM killer, or
 - **Content types**: JSON for most endpoints; multipart/form-data for document uploads
 - **Response caching**: In-memory TTL cache for metadata list endpoints (tags, correspondents, document types, storage paths, custom fields). These change infrequently but are queried often by agents doing classification work. Cache is invalidated on create/update/delete operations for the same resource type. No document content or search results are cached.
 - **Transport**: net/http's default transport, or the policy filter's transport when the filter is enabled. The cache stores response bodies after the transport has returned them, so with the filter on it only ever holds filtered data.
+
+### HTTP Mode
+
+`serve` (`serve.go`, `access.go`) offers the MCP server over Streamable HTTP (mcp-go `StreamableHTTPServer`, endpoint `/mcp`, stateless) for remote clients such as a Claude custom connector used by a cloud scheduled task. It is meant to run behind a Cloudflare Tunnel and a Cloudflare Access application with Managed OAuth; nothing at the host accepts inbound connections.
+
+- **Authentication**: every request to `/mcp` needs a `Cf-Access-Jwt-Assertion` JWT. It is verified with `github.com/coreos/go-oidc/v3` against `<team domain>/cdn-cgi/access/certs` (RS256, keys matched by `kid`): issuer = team domain, audience = Access AUD tag, not expired, and an `email` claim on `PAPERLESS_MCP_ALLOWED_EMAILS`. Failures return `401` with no detail and log the reason. The certs fetch is the only outbound request besides Paperless.
+- **Mandatory settings**: `PAPERLESS_MCP_ACCESS_TEAM_DOMAIN`, `PAPERLESS_MCP_ACCESS_AUD`, `PAPERLESS_MCP_ALLOWED_EMAILS`, and an enabled, valid policy filter. Without them `serve` exits with an error before listening. `PAPERLESS_MCP_HTTP_ADDR` sets the listen address (default `:8080`).
+- **Tool set**: as stdio, except `document_upload` (reads a server path; in a container that reaches `/proc/self/environ`, which holds the token) and `cleanup_downloads` are removed, and `document_download` is inline-only. No download directory is created. The server instructions gain a "Remote (HTTP) Mode" note.
+- **Audit log**: a tool-handler middleware writes one JSON line per call to stdout (email, tool, document IDs from the arguments, result `ok` / `refused_by_policy` / `error`, policy block count, duration). The policy transport counts its blocks on the call's context. No other argument values and no result data are logged.
+- **Health**: `GET /healthz` answers `ok` without authentication; the `healthcheck` subcommand calls it, since the distroless image has no shell or curl. The image runs as the distroless `nonroot` user.
+- **Network**: mcp-go's DNS-rebinding protection stays on; it only acts on loopback connections, so it does not affect requests from a tunnel connector on the container network.
 
 ### Policy Filter
 
@@ -635,6 +647,8 @@ paperless-ngx-mcp/
 ├── main.go                 # Entry point, Cobra root command
 ├── server.go               # MCP server setup and tool registration
 ├── client.go               # Paperless-ngx HTTP client
+├── serve.go                # serve (Streamable HTTP) and healthcheck commands, audit log
+├── access.go               # Cloudflare Access JWT verification for serve
 ├── policy.go               # Policy filter: config, name resolution, tiers, tag hierarchy
 ├── policy_transport.go     # Policy filter: RoundTripper with the request and response rules
 ├── tools_documents.go      # Document tool handlers
@@ -799,6 +813,7 @@ The manifest's `user_config` (abridged above) holds the Paperless URL, the token
 - **Shutdown tests**: `shutdown_test.go` (Unix only) runs the test binary as the `mcp` command in a subprocess, since its `TestMain` calls `main()` when `PAPERLESS_MCP_TEST_RUN_MAIN=1`, and checks that SIGINT, SIGTERM and SIGHUP each exit 0 with nothing on stderr but the policy filter's startup line, that they and a host disconnect mid-call all remove the temp download directory, that stdin EOF or SIGTERM during a slow render still exits 0 promptly, and that a second signal ends a stalled shutdown
 - **CLI tests**: `main_test.go` checks that flag errors print usage and other errors, such as an unset `PAPERLESS_URL` or `PAPERLESS_TOKEN`, don't
 - **Policy filter tests**: `policy_test.go` covers configuration, startup name resolution, tiers and the tag hierarchy; `policy_transport_test.go` runs every request and response rule against an in-memory fake Paperless, checks that blocked requests never reach it, and calls every registered tool through the MCP server for a metadata-tier document whose text, highlights and files carry a marker that must not appear in any result or downloaded file
+- **HTTP mode tests**: `access_test.go` signs JWTs with a test key served from a fake certs endpoint and checks valid, expired, wrong `aud`, wrong `iss`, unlisted email, missing email, wrong key and tampered tokens, plus `401` without detail; `serve_test.go` runs `serve`'s handler end to end against the fake Paperless (auth, tool set, inline downloads, audit log contents, the all-tools leak test over HTTP), checks that `serve` refuses to start without the policy filter or Access settings, and starts and stops the real command with the `healthcheck` subcommand
 - **Coverage threshold**: 70% minimum (enforced in CI)
 
 Test helpers should provide:

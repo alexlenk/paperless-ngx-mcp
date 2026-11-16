@@ -800,6 +800,7 @@ func (t *policyTransport) get(req *http.Request, path string, params url.Values)
 // {"detail": "policy: <reason>"}. The reason names the rule; it never holds
 // credentials, headers or a Paperless response body.
 func (t *policyTransport) block(req *http.Request, format string, args ...any) *http.Response {
+	notePolicyBlock(req.Context())
 	body, _ := encodeJSON(map[string]string{"detail": "policy: " + fmt.Sprintf(format, args...)})
 	return syntheticResponse(req, http.StatusForbidden, http.Header{"Content-Type": {"application/json"}}, body)
 }
