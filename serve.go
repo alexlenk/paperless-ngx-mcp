@@ -28,6 +28,7 @@ import (
 // are not offered.
 
 const (
+	envTools         = "PAPERLESS_MCP_TOOLS"
 	envHTTPAddr      = "PAPERLESS_MCP_HTTP_ADDR"
 	defaultHTTPAddr  = ":8080"
 	mcpEndpointPath  = "/mcp"
@@ -70,6 +71,10 @@ func serveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			tools := splitPolicyNames(os.Getenv(envTools))
+			if err := checkRemoteTools(tools); err != nil {
+				return err
+			}
 			policyCfg, err := loadPolicyConfig(os.Getenv)
 			if err != nil {
 				return err
@@ -99,14 +104,17 @@ func serveCmd() *cobra.Command {
 
 			logger := slog.New(slog.NewJSONHandler(cmd.OutOrStdout(), nil))
 			client := NewClient(baseURL, token, clientOpts...)
-			handler := newServeHandler(ctx, client, downloadConcurrency, access, logger)
+			handler, err := newServeHandler(ctx, client, downloadConcurrency, tools, access, logger)
+			if err != nil {
+				return err
+			}
 
 			ln, err := net.Listen("tcp", addr)
 			if err != nil {
 				return fmt.Errorf("listen on %s: %w", addr, err)
 			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "serve: listening on %s, MCP endpoint %s, Access issuer %s, %d allowed email(s)\n",
-				ln.Addr(), mcpEndpointPath, access.Issuer, len(access.AllowedEmails))
+			fmt.Fprintf(cmd.ErrOrStderr(), "serve: listening on %s, MCP endpoint %s, Access issuer %s, %d allowed email(s), %d tool(s): %s\n",
+				ln.Addr(), mcpEndpointPath, access.Issuer, len(access.AllowedEmails), len(tools), strings.Join(tools, ","))
 			return runHTTPServer(ctx, ln, handler)
 		},
 	}
@@ -117,8 +125,11 @@ func serveCmd() *cobra.Command {
 
 // newServeHandler builds the HTTP handler for serve mode: an unauthenticated
 // health endpoint, and the MCP endpoint behind the Access check.
-func newServeHandler(ctx context.Context, client *Client, downloadConcurrency int, access accessConfig, logger *slog.Logger) http.Handler {
-	srv := newRemoteMCPServer(client, downloadConcurrency, logger)
+func newServeHandler(ctx context.Context, client *Client, downloadConcurrency int, tools []string, access accessConfig, logger *slog.Logger) (http.Handler, error) {
+	srv, err := newRemoteMCPServer(client, downloadConcurrency, tools, logger)
+	if err != nil {
+		return nil, err
+	}
 	streamable := server.NewStreamableHTTPServer(srv,
 		server.WithEndpointPath(mcpEndpointPath),
 		server.WithStateLess(true),
@@ -141,7 +152,7 @@ func newServeHandler(ctx context.Context, client *Client, downloadConcurrency in
 	verifier := newAccessVerifier(context.WithoutCancel(ctx), access)
 	mux.Handle(mcpEndpointPath, requireAccess(verifier, logger,
 		postOnly(http.MaxBytesHandler(streamable, maxRequestBody))))
-	return mux
+	return mux, nil
 }
 
 // postOnly lets only POST through to the MCP endpoint. Sessions are
@@ -160,10 +171,50 @@ func postOnly(next http.Handler) http.Handler {
 	})
 }
 
-// newRemoteMCPServer is NewServer for serve mode: the same tools, minus the
-// ones that read or write the server's own disk, with an audit log of every
-// tool call.
-func newRemoteMCPServer(client *Client, downloadConcurrency int, logger *slog.Logger) *server.MCPServer {
+// newRemoteMCPServer is the MCP server for serve mode: remoteToolSet reduced
+// to the tools in allowed. Every name must be a tool serve offers, so a typo
+// or a tool that is not available over HTTP stops serve from starting; an
+// empty list is refused too.
+func newRemoteMCPServer(client *Client, downloadConcurrency int, allowed []string, logger *slog.Logger) (*server.MCPServer, error) {
+	if len(allowed) == 0 {
+		return nil, fmt.Errorf("serve requires %s: a comma-separated list of the tools to offer", envTools)
+	}
+	srv := remoteToolSet(client, downloadConcurrency, logger)
+	offered := srv.ListTools()
+	keep := map[string]bool{}
+	var unknown []string
+	for _, name := range allowed {
+		if _, ok := offered[name]; !ok {
+			unknown = append(unknown, name)
+		}
+		keep[name] = true
+	}
+	if len(unknown) > 0 {
+		return nil, fmt.Errorf("%s names tools serve does not offer: %s (document_upload and cleanup_downloads are not available over HTTP)",
+			envTools, strings.Join(unknown, ", "))
+	}
+	var drop []string
+	for name := range offered {
+		if !keep[name] {
+			drop = append(drop, name)
+		}
+	}
+	srv.DeleteTools(drop...)
+	return srv, nil
+}
+
+// checkRemoteTools validates a tool allowlist without contacting Paperless,
+// so a bad list fails before any network call. The tool handlers are never
+// invoked here, so the client is an empty placeholder.
+func checkRemoteTools(allowed []string) error {
+	_, err := newRemoteMCPServer(&Client{}, 1, allowed, slog.New(slog.DiscardHandler))
+	return err
+}
+
+// remoteToolSet is NewServer for serve mode: the same tools, minus the ones
+// that read or write the server's own disk, with an audit log of every tool
+// call.
+func remoteToolSet(client *Client, downloadConcurrency int, logger *slog.Logger) *server.MCPServer {
 	// Inline downloads only use the concurrency limit; no directory is created,
 	// so the container's root filesystem can stay read-only.
 	dl := &Downloader{concurrency: downloadConcurrency, files: map[string]struct{}{}}

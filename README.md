@@ -199,6 +199,7 @@ The rules were checked against Paperless-ngx 3.4.2. Re-check them when upgrading
 
 - **Cloudflare Access must vouch for every request.** Cloudflare passes a signed JWT in the `Cf-Access-Jwt-Assertion` header. `serve` checks its RS256 signature against the team's published keys, the issuer, the audience (the Access application's AUD tag), the expiry, and the email against an allowlist. Any failure answers `401` with no detail; the reason is logged. Service-token JWTs, which carry no email, are refused.
 - **The policy filter is mandatory.** `serve` refuses to start unless `PAPERLESS_MCP_POLICY_ENABLED=true` and the filter is fully configured (see [Policy filter](#policy-filter)).
+- **Only the tools you list.** `PAPERLESS_MCP_TOOLS` names the tools `serve` offers; all others are neither listed nor callable. It is required, and a name that isn't a tool `serve` offers stops it from starting, so a typo fails closed. This holds even if a tool is switched back on in the client.
 - **No tools that use the server's own disk.** `document_upload` (it reads a file path on the server, which in a container includes `/proc/self/environ` and thus the token) and `cleanup_downloads` are not offered, and `document_download` returns content inline only (no `dest_dir`, no `content` switch). No download directory is created, so the root filesystem can be read-only.
 - **Audit log.** One JSON line per tool call on stdout: time, email, tool, the document IDs named in the arguments, the result (`ok`, `refused_by_policy`, `partly_refused_by_policy` for e.g. a multi-document download where only some were refused, or `error`), the number of policy blocks and the duration. It never contains other argument values or any part of a result.
 
@@ -211,6 +212,7 @@ Endpoints: `/mcp` (the MCP endpoint; every method needs a valid Access JWT, othe
 | `PAPERLESS_MCP_ACCESS_TEAM_DOMAIN` | yes | Your Cloudflare Access team domain, e.g. `https://<team>.cloudflareaccess.com`. The JWT's issuer must match it, and the signing keys are fetched from `<team domain>/cdn-cgi/access/certs`. |
 | `PAPERLESS_MCP_ACCESS_AUD` | yes | The Access application's AUD tag |
 | `PAPERLESS_MCP_ALLOWED_EMAILS` | yes | Comma-separated email addresses allowed to use the server (case-insensitive) |
+| `PAPERLESS_MCP_TOOLS` | yes | Comma-separated names of the tools to offer, e.g. `document_list,document_get,tag_list` |
 | `PAPERLESS_MCP_HTTP_ADDR` | no | Listen address, default `:8080` |
 
 Without any of the required settings, `serve` exits with an error before it listens.
@@ -235,6 +237,7 @@ services:
       PAPERLESS_MCP_ACCESS_TEAM_DOMAIN: https://<team>.cloudflareaccess.com
       PAPERLESS_MCP_ACCESS_AUD: <AUD tag of the Access application>
       PAPERLESS_MCP_ALLOWED_EMAILS: <your email>
+      PAPERLESS_MCP_TOOLS: document_list,document_get,document_metadata,search_global,tag_list,correspondent_list,document_type_list,custom_field_list
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

@@ -80,7 +80,7 @@ The MCP server is configured via environment variables:
 | `PAPERLESS_URL` | yes | Base URL of the Paperless-ngx instance |
 | `PAPERLESS_TOKEN` | yes | API authentication token |
 | `PAPERLESS_MCP_POLICY_*` | no | Optional policy filter, off by default (see README "Policy filter"); required for `serve` |
-| `PAPERLESS_MCP_ACCESS_TEAM_DOMAIN`, `PAPERLESS_MCP_ACCESS_AUD`, `PAPERLESS_MCP_ALLOWED_EMAILS` | for `serve` | Cloudflare Access checks (see README "HTTP mode") |
+| `PAPERLESS_MCP_ACCESS_TEAM_DOMAIN`, `PAPERLESS_MCP_ACCESS_AUD`, `PAPERLESS_MCP_ALLOWED_EMAILS`, `PAPERLESS_MCP_TOOLS` | for `serve` | Cloudflare Access checks (see README "HTTP mode") |
 | `PAPERLESS_MCP_HTTP_ADDR` | no | `serve` listen address, default `:8080` |
 
 ## Architecture

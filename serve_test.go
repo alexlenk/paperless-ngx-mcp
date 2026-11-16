@@ -31,14 +31,29 @@ type serveFixture struct {
 	logs   *lockedBuffer
 }
 
+// allRemoteTools lists every tool serve can offer.
+func allRemoteTools() []string {
+	srv := remoteToolSet(NewClient("http://127.0.0.1:9", "unused"), 1, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	return slices.Sorted(maps.Keys(srv.ListTools()))
+}
+
 func newServeFixture(t *testing.T) *serveFixture {
+	t.Helper()
+	return newServeFixtureWithTools(t, allRemoteTools())
+}
+
+func newServeFixtureWithTools(t *testing.T, tools []string) *serveFixture {
 	t.Helper()
 	fp := newFakePaperless(t)
 	access := newAccessFixture(t)
 	logs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	client := fp.policyClient(t)
-	srv := httptest.NewServer(newServeHandler(context.Background(), client, 2, access.config, logger))
+	handler, err := newServeHandler(context.Background(), client, 2, tools, access.config, logger)
+	if err != nil {
+		t.Fatalf("newServeHandler: %s", err)
+	}
+	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 	return &serveFixture{fp: fp, access: access, srv: srv, logs: logs}
 }
@@ -345,6 +360,7 @@ func TestServeRefusesToStart(t *testing.T) {
 		envAccessTeamDomain: "example-team.cloudflareaccess.com",
 		envAccessAUD:        testAccessAUD,
 		envAllowedEmails:    testEmail,
+		envTools:            "document_get,document_list",
 	}
 	for _, tc := range []struct {
 		name    string
@@ -356,10 +372,13 @@ func TestServeRefusesToStart(t *testing.T) {
 		{"no Access AUD", merge(testPolicyEnv(), access, map[string]string{envAccessAUD: ""}), "serve requires PAPERLESS_MCP_ACCESS_AUD"},
 		{"no allowed emails", merge(testPolicyEnv(), access, map[string]string{envAllowedEmails: ""}), "serve requires PAPERLESS_MCP_ALLOWED_EMAILS"},
 		{"policy misconfigured", merge(testPolicyEnv(), access, map[string]string{envPolicyFullTags: ""}), "PAPERLESS_MCP_POLICY_FULL_TAGS must name at least one tag"},
+		{"no tool list", merge(testPolicyEnv(), access, map[string]string{envTools: " , "}), "serve requires PAPERLESS_MCP_TOOLS"},
+		{"unknown tool", merge(testPolicyEnv(), access, map[string]string{envTools: "document_get,document_gett"}), "PAPERLESS_MCP_TOOLS names tools serve does not offer: document_gett"},
+		{"tool not available over HTTP", merge(testPolicyEnv(), access, map[string]string{envTools: "document_get,document_upload"}), "does not offer: document_upload"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, k := range []string{envPolicyEnabled, envPolicyFullTags, envPolicyMetadataTags, envPolicyRestrictedTags,
-				envPolicyProtectedTags, envPolicyProtectedCustomFields, envAccessTeamDomain, envAccessAUD, envAllowedEmails} {
+				envPolicyProtectedTags, envPolicyProtectedCustomFields, envAccessTeamDomain, envAccessAUD, envAllowedEmails, envTools} {
 				t.Setenv(k, "")
 			}
 			for k, v := range tc.env {
@@ -401,6 +420,7 @@ func TestServeStartsAndStopsCleanly(t *testing.T) {
 		envAccessTeamDomain: "example-team.cloudflareaccess.com",
 		envAccessAUD:        testAccessAUD,
 		envAllowedEmails:    testEmail,
+		envTools:            "document_get, document_list",
 		"PAPERLESS_URL":     fp.srv.URL,
 		"PAPERLESS_TOKEN":   "test-token",
 	})
@@ -442,7 +462,8 @@ func TestServeStartsAndStopsCleanly(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if !strings.Contains(stderr.String(), "policy filter: enabled") || !strings.Contains(stderr.String(), "serve: listening on "+addr) {
+	if !strings.Contains(stderr.String(), "policy filter: enabled") || !strings.Contains(stderr.String(), "serve: listening on "+addr) ||
+		!strings.Contains(stderr.String(), "2 tool(s): document_get,document_list") {
 		t.Errorf("startup log:\n%s", stderr.String())
 	}
 
@@ -617,5 +638,37 @@ func TestServeAuditPartialRefusal(t *testing.T) {
 	lines := f.auditLines(t)
 	if len(lines) != 1 || lines[0]["result"] != "partly_refused_by_policy" || lines[0]["policy_blocks"] != float64(1) {
 		t.Errorf("audit = %v, want one partly_refused_by_policy line with 1 block", lines)
+	}
+}
+
+func TestServeOffersOnlyAllowedTools(t *testing.T) {
+	f := newServeFixtureWithTools(t, []string{"document_get", "tag_list"})
+	status, out := f.rpc(t, f.access.token(t, nil), "tools/list", map[string]any{})
+	if status != http.StatusOK {
+		t.Fatalf("tools/list: %d %v", status, out)
+	}
+	var names []string
+	for _, tool := range out["result"].(map[string]any)["tools"].([]any) {
+		names = append(names, tool.(map[string]any)["name"].(string))
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"document_get", "tag_list"}) {
+		t.Errorf("tools = %v, want only document_get and tag_list", names)
+	}
+
+	// A tool left out can't be called either.
+	_, raw := f.call(t, "document_delete", map[string]any{"id": docFull})
+	if !bytes.Contains(raw, []byte("not found")) {
+		t.Errorf("document_delete not in the list: %s", raw)
+	}
+	if f.fp.received(http.MethodDelete, "/api/documents/1/") {
+		t.Error("a tool outside the allowlist reached Paperless")
+	}
+}
+
+func TestNewRemoteMCPServerRejectsEmptyList(t *testing.T) {
+	if _, err := newRemoteMCPServer(NewClient("http://127.0.0.1:9", "unused"), 1, nil, slog.New(slog.NewJSONHandler(io.Discard, nil))); err == nil ||
+		!strings.Contains(err.Error(), "serve requires PAPERLESS_MCP_TOOLS") {
+		t.Errorf("error = %v, want a refusal for an empty tool list", err)
 	}
 }
