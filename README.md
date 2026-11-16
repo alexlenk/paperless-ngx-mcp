@@ -49,7 +49,7 @@ docker run --rm -i \
   ghcr.io/alexlenk/paperless-ngx-mcp:latest mcp
 ```
 
-The image is based on distroless `static-debian12:nonroot` and runs as an unprivileged user (UID 65532). To run the server over HTTP instead, see [HTTP mode](#http-mode-serve).
+The image is based on distroless `static-debian12:nonroot` and runs as an unprivileged user (UID 65532). A directory you mount for `PAPERLESS_MCP_DOWNLOAD_DIR` must be writable by that user. To run the server over HTTP instead, see [HTTP mode](#http-mode-serve).
 
 ### From source
 
@@ -202,7 +202,7 @@ The rules were checked against Paperless-ngx 3.4.2. Re-check them when upgrading
 - **No tools that use the server's own disk.** `document_upload` (it reads a file path on the server, which in a container includes `/proc/self/environ` and thus the token) and `cleanup_downloads` are not offered, and `document_download` returns content inline only (no `dest_dir`, no `content` switch). No download directory is created, so the root filesystem can be read-only.
 - **Audit log.** One JSON line per tool call on stdout: time, email, tool, the document IDs named in the arguments, the result (`ok`, `refused_by_policy` or `error`), the number of policy blocks and the duration. It never contains other argument values or any part of a result.
 
-Endpoints: `POST /mcp` (the MCP endpoint, behind the Access check) and `GET /healthz` (unauthenticated, answers `ok`). Everything else is `404`. Sessions are stateless.
+Endpoints: `/mcp` (the MCP endpoint; every method needs a valid Access JWT, otherwise `401`) and `GET /healthz` (unauthenticated, answers `ok`). Other paths answer `404`. Sessions are stateless.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -256,6 +256,9 @@ secrets:
 ```
 
 Publish no ports: cloudflared connects outbound, and only it talks to `paperless-mcp`. Give the tunnel exactly one public hostname, pointing at `paperless-mcp`, and none for Paperless itself.
+
+- `serve` looks up the policy filter's tag and field names in Paperless before it listens. If Paperless isn't up yet, `serve` exits with an error and `restart: unless-stopped` starts it again; adding `depends_on` on the Paperless service shortens that.
+- The cloudflared image runs as UID 65532, so `tunnel_token.txt` must be readable by that user.
 
 ## Tools
 
