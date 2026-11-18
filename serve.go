@@ -37,6 +37,10 @@ const (
 	healthcheckLimit = 5 * time.Second
 )
 
+// serveStartupRetry is how long serve waits for an unreachable Paperless at
+// startup before giving up.
+const serveStartupRetry = 2 * time.Minute
+
 // shutdownTimeout is how long a shutdown waits for requests in flight before
 // closing their connections. A variable so tests can shorten it.
 var shutdownTimeout = 10 * time.Second
@@ -92,7 +96,9 @@ func serveCmd() *cobra.Command {
 			defer stop()
 			context.AfterFunc(ctx, stop)
 
-			clientOpts, err := configurePolicy(ctx, os.Getenv, baseURL, token, http.DefaultTransport, cmd.ErrOrStderr())
+			// Paperless may still be starting (e.g. after a NAS reboot), so
+			// wait for it rather than exit and rely on the restart policy.
+			clientOpts, err := configurePolicyRetry(ctx, os.Getenv, baseURL, token, http.DefaultTransport, cmd.ErrOrStderr(), serveStartupRetry)
 			if err != nil {
 				return err
 			}

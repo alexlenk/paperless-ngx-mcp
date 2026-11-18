@@ -263,7 +263,7 @@ secrets:
 
 Publish no ports: cloudflared connects outbound, and only it talks to `paperless-mcp`. Give the tunnel exactly one public hostname, pointing at `paperless-mcp`, and none for Paperless itself.
 
-- `serve` looks up the policy filter's tag and field names in Paperless before it listens. If Paperless isn't up yet, `serve` exits with an error and `restart: unless-stopped` starts it again; adding `depends_on` on the Paperless service shortens that.
+- `serve` looks up the policy filter's tag and field names in Paperless before it listens. If Paperless isn't reachable yet (for example right after a reboot), it waits and retries for up to 2 minutes, logging each attempt; a wrong token or tag name stops it at once. `depends_on` on the Paperless service still helps with the start order.
 - The cloudflared image runs as UID 65532, so `tunnel_token.txt` must be readable by that user.
 
 ## Tools
