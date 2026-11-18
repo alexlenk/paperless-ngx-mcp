@@ -341,6 +341,15 @@ func setOf(ids []int) map[int]bool {
 // base is the transport that carries all Paperless traffic, including the
 // startup lookups.
 func configurePolicy(ctx context.Context, getenv func(string) string, baseURL, token string, base http.RoundTripper, logw io.Writer) ([]ClientOption, error) {
+	return configurePolicyRetry(ctx, getenv, baseURL, token, base, logw, 0)
+}
+
+// configurePolicyRetry is configurePolicy with a startup retry: while
+// Paperless can't be reached (connection errors, or 502/503/504 while it
+// starts), the name lookups are retried for up to retryFor, with growing
+// pauses. Any other answer, such as a wrong token or an unknown tag name,
+// fails at once. A retryFor of 0 means no retries.
+func configurePolicyRetry(ctx context.Context, getenv func(string) string, baseURL, token string, base http.RoundTripper, logw io.Writer, retryFor time.Duration) ([]ClientOption, error) {
 	cfg, err := loadPolicyConfig(getenv)
 	if err != nil {
 		return nil, err
@@ -350,7 +359,8 @@ func configurePolicy(ctx context.Context, getenv func(string) string, baseURL, t
 		return nil, nil
 	}
 
-	r := &policyResolver{base: base, baseURL: strings.TrimRight(baseURL, "/"), token: token}
+	r := &policyResolver{base: base, baseURL: strings.TrimRight(baseURL, "/"), token: token,
+		retryFor: retryFor, retryDelay: policyRetryFirstDelay, logw: logw}
 	var full, metadata, restricted, protected, fields []namedID
 	for _, step := range []struct {
 		names []string
@@ -410,7 +420,17 @@ type policyResolver struct {
 	base    http.RoundTripper
 	baseURL string
 	token   string
+
+	retryFor   time.Duration // how long to keep retrying while Paperless is unreachable
+	retryDelay time.Duration // first pause; doubles up to policyRetryMaxDelay
+	logw       io.Writer
 }
+
+// Pauses between startup lookups while Paperless is unreachable. The first
+// pause is a variable so tests can shorten it.
+var policyRetryFirstDelay = time.Second
+
+const policyRetryMaxDelay = 10 * time.Second
 
 // resolve returns the ID of the one tag or custom field named name. The
 // lookup is case-insensitive in Paperless (name__iexact); the match is then
@@ -418,31 +438,54 @@ type policyResolver struct {
 // is an error. Errors name the object and the HTTP status, never the token or
 // a response body.
 func (r *policyResolver) resolve(ctx context.Context, kind, name string) (int, error) {
+	deadline := time.Now().Add(r.retryFor)
+	delay := r.retryDelay
+	for {
+		id, retryable, err := r.resolveOnce(ctx, kind, name)
+		if err == nil || !retryable || r.retryFor <= 0 || time.Now().Add(delay).After(deadline) {
+			return id, err
+		}
+		fmt.Fprintf(r.logw, "policy filter: Paperless not reachable yet (%s); retrying in %s\n", err, delay)
+		select {
+		case <-ctx.Done():
+			return 0, err
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, policyRetryMaxDelay)
+	}
+}
+
+// resolveOnce performs one lookup. retryable reports whether the failure
+// means Paperless isn't reachable yet (connection error, 502, 503, 504).
+func (r *policyResolver) resolveOnce(ctx context.Context, kind, name string) (id int, retryable bool, err error) {
 	path := "/api/tags/"
 	if kind == "custom field" {
 		path = "/api/custom_fields/"
 	}
 	params := url.Values{"name__iexact": {name}, "page_size": {"100"}}
 
-	ctx, cancel := context.WithTimeout(ctx, policyLookupTimeout)
+	attemptCtx, cancel := context.WithTimeout(ctx, policyLookupTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.baseURL+path+"?"+params.Encode(), nil)
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, r.baseURL+path+"?"+params.Encode(), nil)
 	if err != nil {
-		return 0, fmt.Errorf("policy: resolve %s %q: %w", kind, name, err)
+		return 0, false, fmt.Errorf("policy: resolve %s %q: %w", kind, name, err)
 	}
 	req.Header.Set("Authorization", "Token "+r.token)
 	req.Header.Set("Accept", "application/json; version="+apiVersion)
 	resp, err := r.base.RoundTrip(req)
 	if err != nil {
-		return 0, fmt.Errorf("policy: resolve %s %q: request failed: %s", kind, name, redactURLError(err))
+		// Retry, unless the caller's context is done (shutdown); a timed-out
+		// attempt is retried.
+		return 0, ctx.Err() == nil, fmt.Errorf("policy: resolve %s %q: request failed: %s", kind, name, redactURLError(err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, fmt.Errorf("policy: resolve %s %q: read response: %w", kind, name, err)
+		return 0, true, fmt.Errorf("policy: resolve %s %q: read response: %w", kind, name, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("policy: resolve %s %q: Paperless answered with status %d", kind, name, resp.StatusCode)
+		retry := resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout
+		return 0, retry, fmt.Errorf("policy: resolve %s %q: Paperless answered with status %d", kind, name, resp.StatusCode)
 	}
 
 	var page struct {
@@ -452,7 +495,7 @@ func (r *policyResolver) resolve(ctx context.Context, kind, name string) (int, e
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(body, &page); err != nil {
-		return 0, fmt.Errorf("policy: resolve %s %q: unexpected response format", kind, name)
+		return 0, false, fmt.Errorf("policy: resolve %s %q: unexpected response format", kind, name)
 	}
 	var ids []int
 	for _, obj := range page.Results {
@@ -462,11 +505,11 @@ func (r *policyResolver) resolve(ctx context.Context, kind, name string) (int, e
 	}
 	switch len(ids) {
 	case 1:
-		return ids[0], nil
+		return ids[0], false, nil
 	case 0:
-		return 0, fmt.Errorf("policy: %s %q not found (the name must match exactly, including case, and be visible to the API user)", kind, name)
+		return 0, false, fmt.Errorf("policy: %s %q not found (the name must match exactly, including case, and be visible to the API user)", kind, name)
 	default:
-		return 0, fmt.Errorf("policy: %s name %q is ambiguous: it matches %d objects (IDs %s)", kind, name, len(ids), joinInts(ids))
+		return 0, false, fmt.Errorf("policy: %s name %q is ambiguous: it matches %d objects (IDs %s)", kind, name, len(ids), joinInts(ids))
 	}
 }
 

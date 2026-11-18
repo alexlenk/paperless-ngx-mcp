@@ -7,6 +7,8 @@ MCP server for Paperless-ngx document management, built in Go.
 - `main.go` — Entry point, Cobra root command, `mcp` subcommand
 - `server.go` — MCP server setup, tool registration, agent instructions
 - `client.go` — Paperless-ngx HTTP client with auth, versioning, multipart upload
+- `serve.go` — `serve` (Streamable HTTP) and `healthcheck` subcommands, remote tool set, audit log
+- `access.go` — Cloudflare Access JWT verification for `serve`
 - `policy.go` — Optional policy filter: config, name resolution, tiers, tag hierarchy
 - `policy_transport.go` — Policy filter RoundTripper: request and response rules
 - `helpers.go` — Shared helpers (errResult, jsonResult, doRequest, param helpers)
@@ -77,7 +79,9 @@ The MCP server is configured via environment variables:
 |----------|----------|-------------|
 | `PAPERLESS_URL` | yes | Base URL of the Paperless-ngx instance |
 | `PAPERLESS_TOKEN` | yes | API authentication token |
-| `PAPERLESS_MCP_POLICY_*` | no | Optional policy filter, off by default (see README "Policy filter") |
+| `PAPERLESS_MCP_POLICY_*` | no | Optional policy filter, off by default (see README "Policy filter"); required for `serve` |
+| `PAPERLESS_MCP_ACCESS_TEAM_DOMAIN`, `PAPERLESS_MCP_ACCESS_AUD`, `PAPERLESS_MCP_ALLOWED_EMAILS`, `PAPERLESS_MCP_TOOLS` | for `serve` | Cloudflare Access checks (see README "HTTP mode") |
+| `PAPERLESS_MCP_HTTP_ADDR` | no | `serve` listen address, default `:8080` |
 
 ## Architecture
 

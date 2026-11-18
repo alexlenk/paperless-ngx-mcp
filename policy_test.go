@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // Test IDs. They deliberately differ from any real instance's IDs.
@@ -476,5 +479,116 @@ func TestMCPExitsOnPolicyErrors(t *testing.T) {
 				t.Errorf("stderr contains the token:\n%s", stderr.String())
 			}
 		})
+	}
+}
+
+// shortRetryDelay shortens the startup retry's first pause for a test.
+func shortRetryDelay(t *testing.T) {
+	old := policyRetryFirstDelay
+	policyRetryFirstDelay = 20 * time.Millisecond
+	t.Cleanup(func() { policyRetryFirstDelay = old })
+}
+
+func TestConfigurePolicyRetryWaitsForPaperless(t *testing.T) {
+	shortRetryDelay(t)
+	ready := resolveServer(t, defaultResolveTags(), defaultResolveFields())
+	var mu sync.Mutex
+	attempts := 0
+	starting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		if n <= 2 { // Paperless still starting
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		proxy, _ := http.NewRequest(r.Method, ready.URL+r.URL.RequestURI(), nil)
+		proxy.Header = r.Header
+		resp, err := http.DefaultTransport.RoundTrip(proxy)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	}))
+	t.Cleanup(starting.Close)
+
+	var log bytes.Buffer
+	opts, err := configurePolicyRetry(context.Background(), getenvFrom(testPolicyEnv()), starting.URL, "test-token", http.DefaultTransport, &log, 5*time.Second)
+	if err != nil {
+		t.Fatalf("configurePolicyRetry: %s\n%s", err, log.String())
+	}
+	if len(opts) != 1 {
+		t.Fatalf("got %d client options, want the policy transport", len(opts))
+	}
+	if got := strings.Count(log.String(), "policy filter: Paperless not reachable yet"); got != 2 {
+		t.Errorf("logged %d retries, want 2:\n%s", got, log.String())
+	}
+	if !strings.Contains(log.String(), "policy filter: enabled") || strings.Contains(log.String(), "test-token") {
+		t.Errorf("startup log:\n%s", log.String())
+	}
+}
+
+func TestConfigurePolicyRetryDoesNotRetryRealErrors(t *testing.T) {
+	shortRetryDelay(t)
+	var mu sync.Mutex
+	attempts := 0
+	unauthorized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(unauthorized.Close)
+	_, err := configurePolicyRetry(context.Background(), getenvFrom(testPolicyEnv()), unauthorized.URL, "test-token", http.DefaultTransport, io.Discard, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "status 401") {
+		t.Fatalf("error = %v, want status 401", err)
+	}
+	if attempts != 1 {
+		t.Errorf("a 401 was tried %d times, want once", attempts)
+	}
+
+	// An unknown tag name is not retried either.
+	srv := resolveServer(t, defaultResolveTags(), defaultResolveFields())
+	env := testPolicyEnv()
+	env[envPolicyProtectedTags] = "no-such-tag"
+	start := time.Now()
+	_, err = configurePolicyRetry(context.Background(), getenvFrom(env), srv.URL, "test-token", http.DefaultTransport, io.Discard, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), `tag "no-such-tag" not found`) || time.Since(start) > 2*time.Second {
+		t.Errorf("unknown tag: %v after %s", err, time.Since(start))
+	}
+}
+
+func TestConfigurePolicyRetryGivesUp(t *testing.T) {
+	shortRetryDelay(t)
+	var log bytes.Buffer
+	start := time.Now()
+	_, err := configurePolicyRetry(context.Background(), getenvFrom(testPolicyEnv()), "http://127.0.0.1:9", "test-token", http.DefaultTransport, &log, 300*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "request failed") {
+		t.Fatalf("error = %v, want a connection failure", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("gave up after %s, want about the retry window", elapsed)
+	}
+	if !strings.Contains(log.String(), "retrying in") {
+		t.Errorf("no retry logged:\n%s", log.String())
+	}
+}
+
+func TestConfigurePolicyRetryStopsOnShutdown(t *testing.T) {
+	shortRetryDelay(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := configurePolicyRetry(ctx, getenvFrom(testPolicyEnv()), "http://127.0.0.1:9", "test-token", http.DefaultTransport, io.Discard, time.Minute)
+	if err == nil {
+		t.Fatal("succeeded without Paperless")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("kept retrying %s after shutdown was requested", elapsed)
 	}
 }
