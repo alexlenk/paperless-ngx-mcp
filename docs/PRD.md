@@ -751,6 +751,10 @@ Mirrors tasks-mcp CI:
 - Steps: checkout, detect Go changes, vet, staticcheck, test with race detector, enforce 70% coverage, build
 - Protected main branch — PRs required
 
+### Branch Image Workflow
+
+`.github/workflows/image.yml` runs on every push to a branch (and on demand): it runs the tests, then builds the Docker image for linux/amd64 and linux/arm64 and pushes it to GHCR tagged with the branch name (slashes become dashes) and `sha-<short commit>`. It never sets `latest`; version and `latest` tags come only from the release workflow. The Dockerfile's build stage runs on the build platform and cross-compiles (`GOOS`/`GOARCH` from `TARGETOS`/`TARGETARCH`), so multi-platform builds need no emulation.
+
 ### Release Workflow
 
 Mirrors tasks-mcp release:

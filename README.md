@@ -51,6 +51,8 @@ docker run --rm -i \
 
 To run the server over HTTP instead, see [HTTP mode](#http-mode-serve).
 
+Besides release images, every push to a branch builds `ghcr.io/alexlenk/paperless-ngx-mcp:<branch>` (slashes become dashes) and `:sha-<short commit>` for amd64 and arm64, for testing a branch before it is released. These never move `latest`.
+
 ### From source
 
 ```bash
